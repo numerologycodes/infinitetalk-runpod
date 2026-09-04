@@ -1,5 +1,5 @@
 # Use specific version of nvidia cuda image
-FROM wlsdml1114/engui_genai-base_blackwell:1.1 as runtime
+FROM wlsdml1114/engui_genai-base_blackwell:1.1 AS runtime
 
 # ---------------------------------------------------------
 # SYSTEM TOOLS
@@ -84,43 +84,16 @@ RUN cd /ComfyUI/custom_nodes && \
     pip install -r requirements.txt
 
 # ---------------------------------------------------------
-# TRANSFORMERS COMPATIBILITY
-# ---------------------------------------------------------
-
-RUN pip install --no-cache-dir --force-reinstall \
-    "transformers==4.53.2"
-
-RUN python - <<'PY'
-import transformers
-
-expected = "4.53.2"
-actual = transformers.__version__
-
-print(f"Transformers installed version: {actual}")
-
-if actual != expected:
-    raise RuntimeError(
-        f"Wrong Transformers version. Expected {expected}, got {actual}"
-    )
-
-print("Transformers compatibility pin verified.")
-PY
-
-# ---------------------------------------------------------
-# PATCH MULTITALK WAV2VEC OUTPUT
+# MULTITALK WAV2VEC PATCH
 # ---------------------------------------------------------
 #
-# WanVideoWrapper currently assumes:
+# Problem observed in our RunPod worker:
 #
-#     embeddings.hidden_states
+# embeddings.hidden_states == None
 #
-# always exists.
+# Patch only the two semantic statements we need instead of
+# matching a large formatting-sensitive source block.
 #
-# On our runtime Wav2Vec returns an object where hidden_states
-# can be None even though output_hidden_states=True was passed.
-#
-# Normalize the output and fail explicitly if Wav2Vec does not
-# provide usable hidden states.
 # ---------------------------------------------------------
 
 RUN python - <<'PY'
@@ -136,66 +109,76 @@ if not path.exists():
 
 text = path.read_text(encoding="utf-8")
 
-old = '''            embeddings = wav2vec2(audio_feature.to(dtype), seq_len=int(video_length), output_hidden_states=True)
-            wav2vec2.to(offload_device)
-            if len(embeddings) == 0:
-                print("Fail to extract audio embedding for one speaker")
-                continue
+call_marker = (
+    "embeddings = wav2vec2("
+    "audio_feature.to(dtype), "
+    "seq_len=int(video_length), "
+    "output_hidden_states=True)"
+)
 
-            audio_emb = torch.stack(embeddings.hidden_states[1:], dim=1).squeeze(0)'''
+stack_marker = (
+    "audio_emb = torch.stack("
+    "embeddings.hidden_states[1:], dim=1).squeeze(0)"
+)
 
-new = '''            try:
-                outputs = wav2vec2(
-                    audio_feature.to(dtype),
-                    seq_len=int(video_length),
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
-            except TypeError:
-                outputs = wav2vec2(
-                    audio_feature.to(dtype),
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
+if call_marker not in text:
+    raise RuntimeError(
+        "Could not find MultiTalk Wav2Vec invocation. "
+        "Upstream WanVideoWrapper changed."
+    )
 
-            wav2vec2.to(offload_device)
+if stack_marker not in text:
+    raise RuntimeError(
+        "Could not find MultiTalk hidden_states consumption. "
+        "Upstream WanVideoWrapper changed."
+    )
 
-            hidden_states = getattr(outputs, "hidden_states", None)
+patched_call = """embeddings = wav2vec2(
+                audio_feature.to(dtype),
+                seq_len=int(video_length),
+                output_hidden_states=True,
+                return_dict=True,
+            )"""
 
-            if hidden_states is None and isinstance(outputs, (list, tuple)):
-                hidden_states = outputs[1:] if len(outputs) > 1 else None
+patched_stack = """hidden_states = getattr(
+                embeddings,
+                "hidden_states",
+                None,
+            )
+
+            if hidden_states is None:
+                try:
+                    hidden_states = embeddings["hidden_states"]
+                except (TypeError, KeyError):
+                    hidden_states = None
 
             if hidden_states is None:
                 raise RuntimeError(
                     "MultiTalk Wav2Vec returned hidden_states=None "
-                    "even with output_hidden_states=True"
+                    "even with output_hidden_states=True and return_dict=True"
                 )
 
             if len(hidden_states) <= 1:
                 raise RuntimeError(
-                    f"MultiTalk Wav2Vec returned insufficient hidden states: "
+                    "MultiTalk Wav2Vec returned insufficient hidden states: "
                     f"{len(hidden_states)}"
                 )
 
             audio_emb = torch.stack(
-                hidden_states[1:], dim=1
-            ).squeeze(0)'''
+                hidden_states[1:],
+                dim=1,
+            ).squeeze(0)"""
 
-if old not in text:
-    raise RuntimeError(
-        "Expected MultiTalk Wav2Vec block was not found. "
-        "WanVideoWrapper upstream changed; refusing unsafe patch."
-    )
-
-text = text.replace(old, new, 1)
+text = text.replace(call_marker, patched_call, 1)
+text = text.replace(stack_marker, patched_stack, 1)
 
 path.write_text(text, encoding="utf-8")
 
-print("MultiTalk Wav2Vec output patch applied successfully.")
+print("MultiTalk Wav2Vec patch applied.")
 PY
 
 # ---------------------------------------------------------
-# VERIFY PATCH
+# VERIFY MULTITALK PATCH
 # ---------------------------------------------------------
 
 RUN python - <<'PY'
@@ -209,11 +192,11 @@ path = Path(
 text = path.read_text(encoding="utf-8")
 
 required = [
-    'return_dict=True',
-    'hidden_states = getattr(outputs, "hidden_states", None)',
-    'MultiTalk Wav2Vec returned hidden_states=None',
-    'torch.stack(',
-    'hidden_states[1:]',
+    "return_dict=True",
+    'hidden_states = getattr(',
+    '"hidden_states"',
+    "MultiTalk Wav2Vec returned hidden_states=None",
+    "hidden_states[1:]",
 ]
 
 for marker in required:
@@ -222,10 +205,29 @@ for marker in required:
             f"MultiTalk patch verification failed: {marker}"
         )
 
+if "embeddings.hidden_states[1:]" in text:
+    raise RuntimeError(
+        "Old unsafe embeddings.hidden_states access still exists."
+    )
+
 compile(text, str(path), "exec")
 
 print("MultiTalk Wav2Vec patch verified.")
 print("nodes.py syntax OK.")
+PY
+
+# ---------------------------------------------------------
+# ENVIRONMENT DIAGNOSTICS
+# ---------------------------------------------------------
+
+RUN python - <<'PY'
+import transformers
+import diffusers
+import huggingface_hub
+
+print("Transformers:", transformers.__version__)
+print("Diffusers:", diffusers.__version__)
+print("HuggingFace Hub:", huggingface_hub.__version__)
 PY
 
 # ---------------------------------------------------------

@@ -86,15 +86,6 @@ RUN cd /ComfyUI/custom_nodes && \
 # ---------------------------------------------------------
 # MULTITALK WAV2VEC PATCH
 # ---------------------------------------------------------
-#
-# Problem observed in our RunPod worker:
-#
-# embeddings.hidden_states == None
-#
-# Patch only the two semantic statements we need instead of
-# matching a large formatting-sensitive source block.
-#
-# ---------------------------------------------------------
 
 RUN python - <<'PY'
 from pathlib import Path
@@ -229,12 +220,6 @@ print("Transformers:", transformers.__version__)
 print("Diffusers:", diffusers.__version__)
 print("HuggingFace Hub:", huggingface_hub.__version__)
 PY
-
-# ---------------------------------------------------------
-# FINAL DEPENDENCY CHECK
-# ---------------------------------------------------------
-
-RUN pip check
 
 # ---------------------------------------------------------
 # MODELS

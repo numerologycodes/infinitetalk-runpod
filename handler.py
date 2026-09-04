@@ -98,6 +98,24 @@ def process_input(input_data, temp_dir, output_filename, input_type):
         raise Exception(f"지원하지 않는 입력 타입: {input_type}")
 
 
+def stage_file_for_comfyui(source_path, task_id, filename):
+    """Copy an input file into ComfyUI/input and return the relative path expected by upload-style loader nodes."""
+    comfy_input_dir = os.getenv("COMFYUI_INPUT_DIR", "/ComfyUI/input")
+    job_input_dir = os.path.join(comfy_input_dir, task_id)
+    os.makedirs(job_input_dir, exist_ok=True)
+
+    destination_path = os.path.join(job_input_dir, filename)
+    shutil.copy2(source_path, destination_path)
+
+    if not os.path.isfile(destination_path):
+        raise Exception(f"Failed to stage ComfyUI input: {destination_path}")
+
+    relative_path = os.path.relpath(destination_path, comfy_input_dir).replace(os.sep, "/")
+    logger.info(f"✅ ComfyUI input staged: {source_path} -> {destination_path}")
+    logger.info(f"📦 ComfyUI loader value: {relative_path}")
+    return relative_path
+
+
 def queue_prompt(prompt, input_type="image", person_count="single"):
     url = f"http://{server_address}:8188/prompt"
     logger.info(f"Queueing prompt to: {url}")
@@ -453,16 +471,23 @@ def handler(job):
     if person_count == "multi" and wav_path_2:
         logger.info(f"두 번째 오디오 파일 크기: {os.path.getsize(wav_path_2)} bytes")
 
-    # 워크플로우 노드 설정
+    # ComfyUI upload-style loader nodes only accept files from ComfyUI/input.
+    # Stage each source there and pass a path relative to the input directory.
     if input_type == "image":
-        # I2V 워크플로우: 이미지 입력 설정
-        prompt["284"]["inputs"]["image"] = media_path
+        comfy_media_value = stage_file_for_comfyui(
+            media_path, task_id, "input_image.jpg"
+        )
+        prompt["284"]["inputs"]["image"] = comfy_media_value
     else:
-        # V2V 워크플로우: 비디오 입력 설정
-        prompt["228"]["inputs"]["video"] = media_path
+        comfy_media_value = stage_file_for_comfyui(
+            media_path, task_id, "input_video.mp4"
+        )
+        prompt["228"]["inputs"]["video"] = comfy_media_value
 
-    # 공통 설정
-    prompt["125"]["inputs"]["audio"] = wav_path
+    comfy_audio_value = stage_file_for_comfyui(
+        wav_path, task_id, "input_audio.wav"
+    )
+    prompt["125"]["inputs"]["audio"] = comfy_audio_value
     prompt["241"]["inputs"]["positive_prompt"] = prompt_text
     prompt["245"]["inputs"]["value"] = width
     prompt["246"]["inputs"]["value"] = height
@@ -474,10 +499,16 @@ def handler(job):
         # 워크플로우 타입에 따라 두 번째 오디오 노드 설정
         if input_type == "image":  # I2V_multi.json의 경우
             if "307" in prompt:
-                prompt["307"]["inputs"]["audio"] = wav_path_2
+                comfy_audio_2_value = stage_file_for_comfyui(
+                    wav_path_2, task_id, "input_audio_2.wav"
+                )
+                prompt["307"]["inputs"]["audio"] = comfy_audio_2_value
         else:  # V2V_multi.json의 경우
             if "313" in prompt:
-                prompt["313"]["inputs"]["audio"] = wav_path_2
+                comfy_audio_2_value = stage_file_for_comfyui(
+                    wav_path_2, task_id, "input_audio_2.wav"
+                )
+                prompt["313"]["inputs"]["audio"] = comfy_audio_2_value
 
     ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
     logger.info(f"Connecting to WebSocket: {ws_url}")

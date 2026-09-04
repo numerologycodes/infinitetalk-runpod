@@ -1,7 +1,10 @@
 # Use specific version of nvidia cuda image
 FROM wlsdml1114/engui_genai-base_blackwell:1.1 as runtime
 
-# Install system tools
+# ---------------------------------------------------------
+# SYSTEM TOOLS
+# ---------------------------------------------------------
+
 RUN apt-get update && \
     apt-get install -y wget && \
     rm -rf /var/lib/apt/lists/*
@@ -81,20 +84,57 @@ RUN cd /ComfyUI/custom_nodes && \
     pip install -r requirements.txt
 
 # ---------------------------------------------------------
-# FIX: INFINITETALK WAV2VEC HIDDEN STATES
+# INFINITETALK / MULTITALK TRANSFORMERS COMPATIBILITY
 # ---------------------------------------------------------
 #
-# InfiniteTalk later accesses embeddings.hidden_states.
-# Force the Wav2Vec model to return hidden states.
+# The base/current dependency chain installs Transformers 5.x.
+# InfiniteTalk MultiTalk Wav2Vec currently fails there with:
 #
-# If WanVideoWrapper changes upstream and this patch can no
-# longer be applied safely, STOP THE BUILD instead of deploying
-# a worker with an unknown configuration.
+# embeddings.hidden_states == None
+#
+# Pin the runtime to the compatible Transformers 4.x branch.
+# Do this AFTER all custom-node requirements have been installed
+# so a previous installation cannot overwrite this version.
+# ---------------------------------------------------------
+
+RUN pip install --no-cache-dir --force-reinstall \
+    "transformers==4.53.2"
+
+# ---------------------------------------------------------
+# VERIFY TRANSFORMERS VERSION
+# ---------------------------------------------------------
+
+RUN python - <<'PY'
+import transformers
+
+expected = "4.53.2"
+actual = transformers.__version__
+
+print(f"Transformers installed version: {actual}")
+
+if actual != expected:
+    raise RuntimeError(
+        f"Wrong Transformers version. "
+        f"Expected {expected}, got {actual}"
+    )
+
+print("Transformers compatibility pin verified.")
+PY
+
+# ---------------------------------------------------------
+# VERIFY MULTITALK WAV2VEC CODE
+# ---------------------------------------------------------
+#
+# Do NOT patch the source here.
+# Current WanVideoWrapper should explicitly request
+# output_hidden_states=True.
+#
+# If upstream changes and this disappears, stop the build
+# instead of silently deploying an unknown configuration.
 # ---------------------------------------------------------
 
 RUN python - <<'PY'
 from pathlib import Path
-import re
 
 path = Path(
     "/ComfyUI/custom_nodes/"
@@ -103,105 +143,25 @@ path = Path(
 
 if not path.exists():
     raise RuntimeError(
-        f"Cannot find WanVideoWrapper multitalk nodes.py: {path}"
+        f"Cannot find MultiTalk nodes.py: {path}"
     )
 
 text = path.read_text(encoding="utf-8")
 
-# If upstream already explicitly requests hidden states,
-# there is nothing to change.
-if re.search(
-    r"output_hidden_states\s*=\s*True",
-    text
-):
-    print("Wav2Vec hidden states are already enabled upstream.")
-
-else:
-    # Locate the model call that creates `embeddings`.
-    #
-    # Example:
-    # embeddings = self.wav2vec2(...)
-    #
-    # and add:
-    # output_hidden_states=True, return_dict=True
-
-    pattern = re.compile(
-        r"(embeddings\s*=\s*"
-        r"self\.[A-Za-z0-9_]*wav2vec[A-Za-z0-9_]*"
-        r"\s*\()",
-        re.IGNORECASE
-    )
-
-    match = pattern.search(text)
-
-    if not match:
-        raise RuntimeError(
-            "Could not locate the Wav2Vec embeddings call. "
-            "Build stopped intentionally."
-        )
-
-    start = match.end()
-
-    # Find the matching closing parenthesis of the call.
-    depth = 1
-    i = start
-
-    while i < len(text) and depth:
-        if text[i] == "(":
-            depth += 1
-        elif text[i] == ")":
-            depth -= 1
-        i += 1
-
-    if depth != 0:
-        raise RuntimeError(
-            "Could not determine the end of the Wav2Vec call."
-        )
-
-    closing_paren = i - 1
-
-    existing_args = text[start:closing_paren].rstrip()
-
-    if existing_args.endswith(","):
-        addition = (
-            "\n"
-            "            output_hidden_states=True,\n"
-            "            return_dict=True"
-        )
-    else:
-        addition = (
-            ",\n"
-            "            output_hidden_states=True,\n"
-            "            return_dict=True"
-        )
-
-    text = (
-        text[:closing_paren]
-        + addition
-        + text[closing_paren:]
-    )
-
-    path.write_text(text, encoding="utf-8")
-
-    print("Applied InfiniteTalk Wav2Vec hidden-states patch.")
-
-# ---------------------------------------------------------
-# VERIFY PATCH
-# ---------------------------------------------------------
-
-verify = path.read_text(encoding="utf-8")
-
-if not re.search(
-    r"output_hidden_states\s*=\s*True",
-    verify
-):
+if "output_hidden_states=True" not in text:
     raise RuntimeError(
-        "Patch verification failed: "
-        "output_hidden_states=True is missing."
+        "WanVideoWrapper MultiTalk no longer explicitly "
+        "requests Wav2Vec hidden states. Build stopped."
     )
 
-print("InfiniteTalk Wav2Vec patch verified successfully.")
+print("MultiTalk Wav2Vec hidden-state request verified.")
 PY
+
+# ---------------------------------------------------------
+# FINAL DEPENDENCY CHECK
+# ---------------------------------------------------------
+
+RUN pip check
 
 # ---------------------------------------------------------
 # MODELS

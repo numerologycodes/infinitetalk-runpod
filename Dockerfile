@@ -84,25 +84,11 @@ RUN cd /ComfyUI/custom_nodes && \
     pip install -r requirements.txt
 
 # ---------------------------------------------------------
-# INFINITETALK / MULTITALK TRANSFORMERS COMPATIBILITY
-# ---------------------------------------------------------
-#
-# The base/current dependency chain installs Transformers 5.x.
-# InfiniteTalk MultiTalk Wav2Vec currently fails there with:
-#
-# embeddings.hidden_states == None
-#
-# Pin the runtime to the compatible Transformers 4.x branch.
-# Do this AFTER all custom-node requirements have been installed
-# so a previous installation cannot overwrite this version.
+# TRANSFORMERS COMPATIBILITY
 # ---------------------------------------------------------
 
 RUN pip install --no-cache-dir --force-reinstall \
     "transformers==4.53.2"
-
-# ---------------------------------------------------------
-# VERIFY TRANSFORMERS VERSION
-# ---------------------------------------------------------
 
 RUN python - <<'PY'
 import transformers
@@ -114,23 +100,27 @@ print(f"Transformers installed version: {actual}")
 
 if actual != expected:
     raise RuntimeError(
-        f"Wrong Transformers version. "
-        f"Expected {expected}, got {actual}"
+        f"Wrong Transformers version. Expected {expected}, got {actual}"
     )
 
 print("Transformers compatibility pin verified.")
 PY
 
 # ---------------------------------------------------------
-# VERIFY MULTITALK WAV2VEC CODE
+# PATCH MULTITALK WAV2VEC OUTPUT
 # ---------------------------------------------------------
 #
-# Do NOT patch the source here.
-# Current WanVideoWrapper should explicitly request
-# output_hidden_states=True.
+# WanVideoWrapper currently assumes:
 #
-# If upstream changes and this disappears, stop the build
-# instead of silently deploying an unknown configuration.
+#     embeddings.hidden_states
+#
+# always exists.
+#
+# On our runtime Wav2Vec returns an object where hidden_states
+# can be None even though output_hidden_states=True was passed.
+#
+# Normalize the output and fail explicitly if Wav2Vec does not
+# provide usable hidden states.
 # ---------------------------------------------------------
 
 RUN python - <<'PY'
@@ -142,19 +132,100 @@ path = Path(
 )
 
 if not path.exists():
-    raise RuntimeError(
-        f"Cannot find MultiTalk nodes.py: {path}"
-    )
+    raise RuntimeError(f"Cannot find MultiTalk nodes.py: {path}")
 
 text = path.read_text(encoding="utf-8")
 
-if "output_hidden_states=True" not in text:
+old = '''            embeddings = wav2vec2(audio_feature.to(dtype), seq_len=int(video_length), output_hidden_states=True)
+            wav2vec2.to(offload_device)
+            if len(embeddings) == 0:
+                print("Fail to extract audio embedding for one speaker")
+                continue
+
+            audio_emb = torch.stack(embeddings.hidden_states[1:], dim=1).squeeze(0)'''
+
+new = '''            try:
+                outputs = wav2vec2(
+                    audio_feature.to(dtype),
+                    seq_len=int(video_length),
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+            except TypeError:
+                outputs = wav2vec2(
+                    audio_feature.to(dtype),
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+
+            wav2vec2.to(offload_device)
+
+            hidden_states = getattr(outputs, "hidden_states", None)
+
+            if hidden_states is None and isinstance(outputs, (list, tuple)):
+                hidden_states = outputs[1:] if len(outputs) > 1 else None
+
+            if hidden_states is None:
+                raise RuntimeError(
+                    "MultiTalk Wav2Vec returned hidden_states=None "
+                    "even with output_hidden_states=True"
+                )
+
+            if len(hidden_states) <= 1:
+                raise RuntimeError(
+                    f"MultiTalk Wav2Vec returned insufficient hidden states: "
+                    f"{len(hidden_states)}"
+                )
+
+            audio_emb = torch.stack(
+                hidden_states[1:], dim=1
+            ).squeeze(0)'''
+
+if old not in text:
     raise RuntimeError(
-        "WanVideoWrapper MultiTalk no longer explicitly "
-        "requests Wav2Vec hidden states. Build stopped."
+        "Expected MultiTalk Wav2Vec block was not found. "
+        "WanVideoWrapper upstream changed; refusing unsafe patch."
     )
 
-print("MultiTalk Wav2Vec hidden-state request verified.")
+text = text.replace(old, new, 1)
+
+path.write_text(text, encoding="utf-8")
+
+print("MultiTalk Wav2Vec output patch applied successfully.")
+PY
+
+# ---------------------------------------------------------
+# VERIFY PATCH
+# ---------------------------------------------------------
+
+RUN python - <<'PY'
+from pathlib import Path
+
+path = Path(
+    "/ComfyUI/custom_nodes/"
+    "ComfyUI-WanVideoWrapper/multitalk/nodes.py"
+)
+
+text = path.read_text(encoding="utf-8")
+
+required = [
+    'return_dict=True',
+    'hidden_states = getattr(outputs, "hidden_states", None)',
+    'MultiTalk Wav2Vec returned hidden_states=None',
+    'torch.stack(',
+    'hidden_states[1:]',
+]
+
+for marker in required:
+    if marker not in text:
+        raise RuntimeError(
+            f"MultiTalk patch verification failed: {marker}"
+        )
+
+compile(text, str(path), "exec")
+
+print("MultiTalk Wav2Vec patch verified.")
+print("nodes.py syntax OK.")
 PY
 
 # ---------------------------------------------------------
